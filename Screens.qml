@@ -56,7 +56,7 @@ Panel {
     return n
   }
   readonly property int disabledCount: Math.max(0, monitors.length - enabledCount)
-  readonly property var scalePresets: ["1", "1.25", "1.5", "2"]
+  readonly property var scalePresets: ["1", "1.2", "1.6", "1.8", "2"]
   readonly property var rotateOptions: [
     { value: "0", label: "Landscape" },
     { value: "1", label: "Portrait 90°" },
