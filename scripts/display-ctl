@@ -12,7 +12,16 @@ Commands:
   profile apply <name>
   profile auto 0|1
   profile primary <identity>
+  workspaces on|off|sync
+  workspace-layout <id> tile|scroll|float
+  workspace-label <id> [name] [icon]
   idle off|on|notice
+  backup-original    snapshot stock files once, before Screens writes them
+  restore-original   put those first snapshots back and reload Hyprland
+  claim              backup leftover config, take over monitors.lua, restore scale keys
+  conflicts          show hyprmoncfg / other display managers still in control
+  bar-care <key> <value>  persist bar dim / hover lift
+  scale up|down|N    step focused-display scale (SUPER+/ and SUPER+ALT+/)
 """
 
 from __future__ import annotations
@@ -27,10 +36,30 @@ import sys
 import time
 
 MONITORS_LUA = os.path.expanduser("~/.config/hypr/monitors.lua")
+BINDINGS_LUA = os.path.expanduser("~/.config/hypr/bindings.lua")
 BACKUP_DIR = os.path.expanduser("~/.local/state/im0001gt.screens")
 PROFILES_PATH = os.path.join(BACKUP_DIR, "profiles.json")
+ORIGINAL_BACKUP = os.path.join(BACKUP_DIR, "original-monitors.lua")
+WORKSPACES_JSON = os.path.join(BACKUP_DIR, "workspaces.json")
+LAYOUTS_DIR = os.path.expanduser("~/.local/state/omarchy/workspace-layouts")
+SHELL_JSON = os.path.expanduser("~/.config/omarchy/shell.json")
+BRIGHTNESS_LINK = os.path.expanduser("~/.local/bin/omarchy-brightness-display")
+PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CTL_PATH = os.path.abspath(__file__)
 MANAGED_BEGIN = "-- BEGIN im0001gt.screens"
 MANAGED_END = "-- END im0001gt.screens"
+STAMPED_BACKUP_GLOB = "monitors.lua.[0-9]*"
+WORKSPACE_COUNT = 10
+OUR_WS_WIDGET = "im0001gt.screens.workspaces"
+STOCK_WS_WIDGET = "omarchy.workspaces"
+HYPRMONCFG_PLUGIN_ID = "crmne.hyprmoncfg"
+HYPRMONCFG_PLUGIN_DIR = os.path.expanduser(
+    "~/.config/omarchy/plugins/%s" % HYPRMONCFG_PLUGIN_ID
+)
+HYPRMONCFG_DAEMON = "hyprmoncfgd"
+HYPRMONCFG_UNIT = HYPRMONCFG_DAEMON + ".service"
+OLED_GUARD_PLUGIN_DIR = os.path.expanduser("~/.config/omarchy/plugins/oled.guard")
+SCALE_PRESETS = (1, 1.25, 1.6, 2, 3, 4)
 
 
 def run(cmd, timeout=4):
@@ -111,21 +140,43 @@ def drm_edid_path(name):
     return matches[0] if matches else None
 
 
+def decode_hdr_max_nits(cv):
+    if not cv:
+        return None
+    return int(round(50.0 * (2.0 ** (cv / 32.0))))
+
+
+def decode_hdr_min_nits(cv, max_nits):
+    if not cv or not max_nits:
+        return None
+    return float(max_nits) * ((cv / 255.0) ** 2) / 100.0
+
+
 def edid_caps(name):
     path = drm_edid_path(name)
-    hdr = False
-    vrr = False
+    caps = {
+        "hdr": False,
+        "vrr": False,
+        "bitdepth": 10,
+        "wide_gamut": False,
+        "min_luminance": None,
+        "max_luminance": None,
+        "max_avg_luminance": None,
+    }
     if not path:
-        return hdr, vrr
+        return caps
     try:
         data = open(path, "rb").read()
     except OSError:
-        return hdr, vrr
+        return caps
     if len(data) < 128:
-        return hdr, vrr
+        return caps
+
+    hdmi_vsdb = False
+    hdmi_deep = False
 
     def walk(block):
-        nonlocal hdr, vrr
+        nonlocal hdmi_vsdb, hdmi_deep
         if len(block) < 5 or block[0] != 0x02:
             return
         dtd = block[2]
@@ -143,15 +194,38 @@ def edid_caps(name):
                 ext = payload[0]
                 # 6 = HDR static metadata, 7 = HDR dynamic metadata
                 if ext in (6, 7):
-                    hdr = True
-                # 14 = HDMI Forum SCDB (VRR), 1 = video capability
+                    caps["hdr"] = True
+                if ext == 6 and len(payload) >= 4:
+                    mx = decode_hdr_max_nits(payload[3])
+                    if mx:
+                        caps["max_luminance"] = mx
+                    if len(payload) >= 5:
+                        avg = decode_hdr_max_nits(payload[4])
+                        if avg:
+                            caps["max_avg_luminance"] = avg
+                    if len(payload) >= 6:
+                        mn = decode_hdr_min_nits(payload[5], caps["max_luminance"])
+                        if mn is not None:
+                            caps["min_luminance"] = mn
+                # 14 = HDMI Forum SCDB (VRR)
+                # 5 = colorimetry (BT2020 bits 0–2)
+                if ext == 5 and len(payload) >= 2 and payload[1] & 0x07:
+                    caps["wide_gamut"] = True
                 if ext == 0x0E:
-                    vrr = True
+                    caps["vrr"] = True
             if tag == 3 and len(payload) >= 3:
                 oui = (payload[0] << 16) | (payload[1] << 8) | payload[2]
-                # HDMI Forum SCDB, AMD FreeSync
+                # HDMI Forum VSDB, AMD FreeSync
                 if oui in (0xC45DD8, 0x00001A):
-                    vrr = True
+                    caps["vrr"] = True
+                if oui == 0xC45DD8:
+                    caps["bitdepth"] = 10
+                # HDMI 1.4 VSDB: byte 6 carries deep-color flags.
+                if oui == 0x000C03:
+                    hdmi_vsdb = True
+                    if len(payload) >= 7 and payload[6] & 0x70:
+                        hdmi_deep = True
+                        caps["bitdepth"] = 10
 
     walk(data[128:256] if len(data) >= 256 else b"")
     if len(data) >= 384:
@@ -159,8 +233,12 @@ def edid_caps(name):
     if len(data) >= 512:
         walk(data[384:512])
     if b"freesync" in data.lower() or b"adaptive-sync" in data.lower():
-        vrr = True
-    return hdr, vrr
+        caps["vrr"] = True
+    # HDMI VSDB with no DC_30/36/48 flag is a strong 8-bit-only signal.
+    # DP/eDP often omit that block; those stay on 10-bit when HDR is present.
+    if hdmi_vsdb and not hdmi_deep:
+        caps["bitdepth"] = 8
+    return caps
 
 
 def current_mode_id(mon):
@@ -192,15 +270,59 @@ def vrr_mode(mon):
         return 0
 
 
-def parse_lua_vrr(text):
+def parse_lua_monitors(text):
     found = {}
     for block in re.findall(r"hl\.monitor\(\{\s*(.*?)\s*\}\)", text or "", re.S):
         out = re.search(r'output\s*=\s*"([^"]+)"', block)
         if not out or not out.group(1):
             continue
+        entry = {}
         m = re.search(r"vrr\s*=\s*(\d+)", block)
-        found[out.group(1)] = int(m.group(1)) if m else 0
+        if m:
+            entry["vrr"] = int(m.group(1))
+        m = re.search(r"bitdepth\s*=\s*(\d+)", block)
+        if m:
+            entry["bitdepth"] = int(m.group(1))
+        m = re.search(r'cm\s*=\s*"([^"]+)"', block)
+        if m:
+            entry["cm"] = m.group(1)
+        m = re.search(r"sdr_min_luminance\s*=\s*([0-9.]+)", block)
+        if m:
+            entry["sdrMinLuminance"] = float(m.group(1))
+        m = re.search(r"sdr_max_luminance\s*=\s*([0-9.]+)", block)
+        if m:
+            entry["sdrMaxLuminance"] = int(float(m.group(1)))
+        m = re.search(r"sdrbrightness\s*=\s*([0-9.]+)", block)
+        if m:
+            entry["sdrBrightness"] = float(m.group(1))
+        m = re.search(r"(?<![a-z_])min_luminance\s*=\s*([0-9.]+)", block)
+        if m:
+            entry["minLuminance"] = float(m.group(1))
+        m = re.search(r"(?<![a-z_])max_luminance\s*=\s*([0-9.]+)", block)
+        if m:
+            entry["maxLuminance"] = int(float(m.group(1)))
+        cm = entry.get("cm") or ""
+        supports = bool(re.search(r"supports_hdr\s*=\s*1", block))
+        if cm in ("hdr", "hdredid"):
+            entry["hdrMode"] = 2
+        elif supports:
+            entry["hdrMode"] = 1
+        found[out.group(1)] = entry
     return found
+
+
+def lua_rule_for(entry, lua_rules):
+    keys = [
+        entry.get("identity") or "",
+        entry.get("name") or "",
+    ]
+    desc = clean_desc(entry.get("description") or "")
+    if desc:
+        keys.append("desc:%s" % desc)
+    for key in keys:
+        if key and key in lua_rules:
+            return lua_rules[key]
+    return {}
 
 
 def read_monitors_lua():
@@ -369,8 +491,18 @@ def stub_monitor(name):
         "cm": "srgb",
         "format": "",
         "hdr": False,
+        "hdrMode": 0,
         "hdrCapable": False,
         "vrrCapable": False,
+        "bitdepth": 8,
+        "bitdepthCapable": 8,
+        "sdrMinLuminance": 0.2,
+        "sdrMaxLuminance": 80,
+        "sdrBrightness": 1.0,
+        "wideGamut": False,
+        "minLuminance": -1,
+        "maxLuminance": -1,
+        "maxAvgLuminance": -1,
         "logicalW": 1920,
         "logicalH": 1080,
         "mode": "preferred",
@@ -401,18 +533,40 @@ def snapshot():
         width = int(mon.get("width") or 0)
         height = int(mon.get("height") or 0)
         lw, lh = logical_size(width, height, scale, transform)
-        hdr_cap, vrr_cap = edid_caps(name)
+        caps = edid_caps(name)
         hdr_on = is_hdr(mon)
         if hdr_on:
-            hdr_cap = True
+            caps["hdr"] = True
         if vrr_mode(mon):
-            vrr_cap = True
-        if not vrr_cap and any(p["refresh"] >= 100 for p in modes):
-            vrr_cap = True
+            caps["vrr"] = True
+        if not caps["vrr"] and any(p["refresh"] >= 100 for p in modes):
+            caps["vrr"] = True
+        fmt = str(mon.get("currentFormat") or "").upper()
+        if any(tok in fmt for tok in ("2101010", "101010", "P010", "P012")):
+            caps["bitdepth"] = 10
         mirror = mon.get("mirrorOf") or ""
         if mirror == "none":
             mirror = ""
         vrr = vrr_mode(mon)
+        cm = mon.get("colorManagementPreset") or "srgb"
+        bitdepth = 10 if hdr_on and caps["bitdepth"] >= 10 else (10 if caps["bitdepth"] >= 10 else 8)
+        if hdr_on and any(tok in fmt for tok in ("XRGB8888", "XR24", "AR24")):
+            bitdepth = 8
+        sdr_min = mon.get("sdrMinLuminance")
+        sdr_max = mon.get("sdrMaxLuminance")
+        try:
+            sdr_min = float(sdr_min) if sdr_min is not None else 0.2
+        except (TypeError, ValueError):
+            sdr_min = 0.2
+        try:
+            sdr_max = int(float(sdr_max)) if sdr_max is not None else 80
+        except (TypeError, ValueError):
+            sdr_max = 80
+        sdr_bright = mon.get("sdrBrightness")
+        try:
+            sdr_bright = float(sdr_bright) if sdr_bright is not None else 1.0
+        except (TypeError, ValueError):
+            sdr_bright = 1.0
         entry = {
             "name": name,
             "description": mon.get("description") or "",
@@ -429,11 +583,21 @@ def snapshot():
             "scale": float(scale),
             "transform": transform,
             "vrr": vrr,
-            "cm": mon.get("colorManagementPreset") or "srgb",
+            "cm": cm,
             "format": mon.get("currentFormat") or "",
             "hdr": hdr_on,
-            "hdrCapable": hdr_cap,
-            "vrrCapable": vrr_cap,
+            "hdrMode": 2 if hdr_on else 0,
+            "hdrCapable": caps["hdr"],
+            "vrrCapable": caps["vrr"],
+            "bitdepth": bitdepth,
+            "bitdepthCapable": 10 if caps["bitdepth"] >= 10 else 8,
+            "sdrMinLuminance": sdr_min,
+            "sdrMaxLuminance": sdr_max,
+            "sdrBrightness": sdr_bright,
+            "wideGamut": bool(caps.get("wide_gamut")),
+            "minLuminance": caps["min_luminance"] if caps["min_luminance"] is not None else -1,
+            "maxLuminance": caps["max_luminance"] if caps["max_luminance"] is not None else -1,
+            "maxAvgLuminance": caps["max_avg_luminance"] if caps["max_avg_luminance"] is not None else -1,
             "logicalW": lw,
             "logicalH": lh,
             "mode": current_mode_id(mon),
@@ -444,14 +608,25 @@ def snapshot():
         }
         entry["identity"] = monitor_identity(entry)
         monitors.append(entry)
-    lua_vrr = parse_lua_vrr(read_monitors_lua())
+    lua_rules = parse_lua_monitors(read_monitors_lua())
+    store_early = load_store()
+    layout_by_id = layout_map(store_early.get("lastLayout"))
     for entry in monitors:
-        key = entry.get("identity") or ""
-        if key in lua_vrr:
-            entry["vrr"] = lua_vrr[key]
-        elif entry.get("name") in lua_vrr:
-            entry["vrr"] = lua_vrr[entry["name"]]
+        saved = layout_by_id.get(entry.get("identity") or "") or {}
+        for key in ("bitdepth", "cm", "hdrMode", "sdrMinLuminance", "sdrMaxLuminance", "sdrBrightness", "minLuminance", "maxLuminance"):
+            if key in saved and saved[key] not in (None, ""):
+                entry[key] = saved[key]
+        rule = lua_rule_for(entry, lua_rules)
+        if "vrr" in rule:
+            entry["vrr"] = rule["vrr"]
+        for key in ("bitdepth", "cm", "hdrMode", "sdrMinLuminance", "sdrMaxLuminance", "sdrBrightness", "minLuminance", "maxLuminance"):
+            if key in rule:
+                entry[key] = rule[key]
+        mode = hdr_mode(entry)
+        entry["hdrMode"] = mode
+        entry["hdr"] = mode == 2
     merge_drm_connected(monitors)
+    ensure_original_backup()
     store = load_store()
     ids = [m["identity"] for m in monitors if m.get("identity")]
     match = match_profile(store, ids)
@@ -489,6 +664,13 @@ def snapshot():
         "connectedKey": "\n".join(sorted(ids)),
         "hybridGpus": hybrid_gpus(),
         "hybridNotice": hybrid_gpus() and not store.get("hybridNoticeShown"),
+        "manageWorkspaces": bool(store.get("manageWorkspaces")),
+        "workspacePlan": workspace_plan(monitors, primary) if store.get("manageWorkspaces") else [],
+        "workspaceLayouts": store.get("workspaceLayouts") or {},
+        "conflict": public_conflict(detect_conflicts()),
+        "claimedMonitors": bool(store.get("claimedMonitors")),
+        "barCare": normalize_bar_care(store.get("barCare")),
+        "oledGuard": os.path.isdir(OLED_GUARD_PLUGIN_DIR),
     }
 
 
@@ -527,6 +709,10 @@ def load_store():
         "lastLayout": [],
         "deskLayout": [],
         "hybridNoticeShown": False,
+        "claimedMonitors": False,
+        "manageWorkspaces": False,
+        "workspaceLayouts": {},
+        "workspacesBarId": "",
     }
     try:
         with open(PROFILES_PATH, encoding="utf-8") as fh:
@@ -546,9 +732,64 @@ def load_store():
             if isinstance(desk_layout, list):
                 store["deskLayout"] = desk_layout
             store["hybridNoticeShown"] = bool(data.get("hybridNoticeShown"))
+            store["claimedMonitors"] = bool(data.get("claimedMonitors"))
+            store["manageWorkspaces"] = bool(data.get("manageWorkspaces"))
+            layouts = data.get("workspaceLayouts")
+            if isinstance(layouts, dict):
+                cleaned = {}
+                for key, value in layouts.items():
+                    mode = clean_workspace_layout(value)
+                    if mode:
+                        cleaned[str(key)] = mode
+                store["workspaceLayouts"] = cleaned
+            store["workspacesBarId"] = str(data.get("workspacesBarId") or "")
+            store["barCare"] = normalize_bar_care(data.get("barCare"))
     except (OSError, json.JSONDecodeError):
         pass
+    if "barCare" not in store:
+        store["barCare"] = normalize_bar_care(None)
     return store
+
+
+def _clamp_int(value, lo, hi, fallback):
+    try:
+        n = int(round(float(value)))
+    except (TypeError, ValueError):
+        return fallback
+    if n < lo:
+        return lo
+    if n > hi:
+        return hi
+    return n
+
+
+def normalize_bar_care(raw):
+    src = raw if isinstance(raw, dict) else {}
+    hover = src.get("hoverLift")
+    return {
+        "enabled": bool(src.get("enabled")),
+        "dim": _clamp_int(src.get("dim"), 0, 100, 45),
+        "hoverLift": True if hover is None else bool(hover),
+    }
+
+
+def set_bar_care(key, value):
+    store = load_store()
+    care = normalize_bar_care(store.get("barCare"))
+    name = str(key or "").strip().lower().replace("_", "-")
+    if name in ("enabled", "on"):
+        care["enabled"] = str(value).strip().lower() in ("1", "true", "on", "yes")
+    elif name == "dim":
+        care["dim"] = _clamp_int(value, 0, 100, care["dim"])
+    elif name in ("hover", "hover-lift", "hoverlift"):
+        care["hoverLift"] = str(value).strip().lower() in ("1", "true", "on", "yes")
+    else:
+        print("bar-care: enabled|dim|hover", file=sys.stderr)
+        return 2
+    store["barCare"] = care
+    save_store(store)
+    print(json.dumps(snapshot(), separators=(",", ":")))
+    return 0
 
 
 def remember_layout(monitors):
@@ -581,7 +822,11 @@ def restore_desk_geometry(monitors):
         rule = hints.get(mon.get("identity") or "")
         if not rule:
             continue
-        for key in ("mode", "x", "y", "scale", "transform", "vrr", "hdr"):
+        for key in (
+            "mode", "x", "y", "scale", "transform", "vrr", "hdr",
+            "hdrMode", "bitdepth", "cm", "sdrMinLuminance", "sdrMaxLuminance",
+            "sdrBrightness", "minLuminance", "maxLuminance",
+        ):
             if key in rule:
                 mon[key] = rule[key]
         mon["mirror"] = ""
@@ -705,12 +950,16 @@ def notice_seen():
 
 
 def save_store(store):
-    os.makedirs(BACKUP_DIR, mode=0o700, exist_ok=True)
+    ensure_private_dir(BACKUP_DIR)
     tmp = PROFILES_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(store, fh, indent=2)
         fh.write("\n")
     os.replace(tmp, PROFILES_PATH)
+    try:
+        os.chmod(PROFILES_PATH, 0o600)
+    except OSError:
+        pass
 
 
 def find_profile(store, name):
@@ -783,6 +1032,66 @@ def clean_scale(value):
     return round(n, 3)
 
 
+def clean_float(value, lo, hi, default):
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return default
+    if n < lo or n > hi:
+        return default
+    return n
+
+
+def clean_bitdepth(value, default=10):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return 10 if n >= 10 else 8
+
+
+def clean_cm(value):
+    text = str(value or "").strip().lower()
+    return text if text in ("hdr", "hdredid") else "hdr"
+
+
+def clean_workspace_layout(value):
+    text = str(value or "").strip().lower()
+    if text in ("tile", "tiling", "tiled", "dwindle"):
+        return "tile"
+    if text in ("scroll", "scrolling"):
+        return "scroll"
+    if text in ("float", "floating"):
+        return "float"
+    return ""
+
+
+def hdr_mode(mon):
+    raw = mon.get("hdrMode")
+    if raw is not None and raw != "":
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            n = -1
+        if n in (0, 1, 2):
+            return n
+    return 2 if mon.get("hdr") else 0
+
+
+def auto_hdr_render(monitors):
+    autos = [m for m in monitors if m.get("enabled", True) and hdr_mode(m) == 1]
+    if not autos:
+        return 0
+    if any(clean_cm(m.get("cm")) == "hdredid" or not m.get("wideGamut") for m in autos):
+        return 2
+    return 1
+
+
+def format_float(n):
+    text = ("%.4f" % float(n)).rstrip("0").rstrip(".")
+    return text if text else "0"
+
+
 def clean_connector(name):
     text = str(name or "").strip()
     return text if CONNECTOR_RE.match(text) else ""
@@ -808,19 +1117,36 @@ def sanitize_monitor(mon, known_names=None):
         "scale": clean_scale(mon.get("scale")),
         "transform": clean_int(mon.get("transform"), 0, 7, 0),
         "vrr": clean_int(mon.get("vrr"), 0, 3, 0),
-        "hdr": bool(mon.get("hdr")),
+        "hdr": hdr_mode(mon) == 2,
+        "hdrMode": hdr_mode(mon),
+        "bitdepth": clean_bitdepth(mon.get("bitdepth"), 10),
+        "cm": clean_cm(mon.get("cm")),
+        "sdrMinLuminance": clean_float(mon.get("sdrMinLuminance"), 0.0, 1.0, 0.005),
+        "sdrMaxLuminance": clean_int(mon.get("sdrMaxLuminance"), 40, 1000, 200),
+        "sdrBrightness": clean_float(mon.get("sdrBrightness"), 0.5, 2.5, 1.0),
+        "minLuminance": clean_float(mon.get("minLuminance"), 0.0, 10.0, -1),
+        "maxLuminance": clean_int(mon.get("maxLuminance"), -1, 10000, -1),
         "enabled": bool(mon.get("enabled", True)),
         "identity": mon.get("identity") or "",
         "mirror": mirror,
     }
 
 
+INTERNAL_PANEL_RE = re.compile(r"^(eDP|LVDS|DSI)", re.I)
+
+
 def output_ref(mon, used_desc):
+    name = clean_connector(mon.get("name"))
+    # omarchy-hyprland-monitor-clamshell only reads the internal panel's rule
+    # when it is keyed by connector name. Behind a desc: key it finds no scale,
+    # falls back to 2, and re-applies it every 2s while docked.
+    if name and INTERNAL_PANEL_RE.match(name):
+        return name
     desc = clean_desc(mon.get("description") or "")
     if desc and desc not in used_desc:
         used_desc.add(desc)
         return "desc:%s" % desc
-    return clean_connector(mon.get("name")) or "Unknown"
+    return name or "Unknown"
 
 
 def monitor_lua(mon, used_desc):
@@ -838,70 +1164,114 @@ def monitor_lua(mon, used_desc):
         fields.append("transform = %d" % transform)
     # Persist the integer even when 0. hyprctl often reports VRR as a boolean.
     fields.append("vrr = %d" % int(mon.get("vrr") or 0))
-    if mon.get("hdr"):
-        fields.append("bitdepth = 10")
-        fields.append('cm = "hdr"')
+    mode = hdr_mode(mon)
+    if mode in (1, 2):
+        fields.append("bitdepth = %d" % clean_bitdepth(mon.get("bitdepth"), 10))
         fields.append("supports_hdr = 1")
+        if mode == 2:
+            fields.append("cm = %s" % lua_str(clean_cm(mon.get("cm"))))
+        sdr_min = mon.get("sdrMinLuminance")
+        if sdr_min is None:
+            sdr_min = 0.005
+        fields.append("sdr_min_luminance = %s" % format_float(sdr_min))
+        fields.append("sdr_max_luminance = %d" % clean_int(mon.get("sdrMaxLuminance"), 40, 1000, 200))
+        sdr_bright = mon.get("sdrBrightness")
+        if sdr_bright is None:
+            sdr_bright = 1.0
+        fields.append("sdrbrightness = %s" % format_float(sdr_bright))
+        min_lum = mon.get("minLuminance")
+        try:
+            min_lum = float(min_lum)
+        except (TypeError, ValueError):
+            min_lum = -1
+        if min_lum >= 0:
+            fields.append("min_luminance = %s" % format_float(min_lum))
+        max_lum = clean_int(mon.get("maxLuminance"), -1, 10000, -1)
+        if max_lum > 0:
+            fields.append("max_luminance = %d" % max_lum)
     mirror = mon.get("mirror") or ""
     if mirror and mirror not in ("none", name, mon.get("name")):
         fields.append("mirror = %s" % lua_str(mirror))
     return "hl.monitor({ %s })" % ", ".join(fields)
 
 
-def render_lua(monitors, gdk_scale):
+def split_counts(n, total=WORKSPACE_COUNT):
+    """Spread `total` workspaces across `n` monitors. Extra slots go to the first."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        n = 0
+    if n <= 0:
+        return []
+    if n >= total:
+        return [1] * total + [0] * (n - total)
+    base = total // n
+    extra = total % n
+    return [base + 1] * extra + [base] * (n - extra)
+
+
+def workspace_hosts(monitors, primary=""):
+    hosts = []
+    for mon in monitors or []:
+        if not mon.get("enabled", True):
+            continue
+        if mon.get("mirror"):
+            continue
+        hosts.append(mon)
+
+    def sort_key(mon):
+        ident = mon.get("identity") or monitor_identity(mon)
+        lead = 0 if (primary and ident == primary) else 1
+        return (lead, int(mon.get("x") or 0), int(mon.get("y") or 0), mon.get("name") or "")
+
+    hosts.sort(key=sort_key)
+    return hosts
+
+
+def workspace_plan(monitors, primary=""):
+    hosts = workspace_hosts(monitors, primary)
+    counts = split_counts(len(hosts))
+    n = 1
+    plan = []
+    for mon, count in zip(hosts, counts):
+        ids = list(range(n, n + count)) if count else []
+        n += count
+        plan.append({
+            "name": mon.get("name") or "",
+            "identity": mon.get("identity") or monitor_identity(mon),
+            "label": mon.get("label") or mon.get("name") or "",
+            "ids": ids,
+            "first": ids[0] if ids else 0,
+            "last": ids[-1] if ids else 0,
+        })
+    return plan
+
+
+def workspace_rule_lines(monitors, primary=""):
+    plan = workspace_plan(monitors, primary)
     used = set()
-    lines = [
-        "-- See https://wiki.hypr.land/Configuring/Basics/Monitors/",
-        "-- Managed by im0001gt.screens (Screens bar panel).",
-        "",
-        "local omarchy_gdk_scale = %s" % gdk_scale,
-        'hl.env("GDK_SCALE", tostring(omarchy_gdk_scale))',
-        "",
-        MANAGED_BEGIN,
-    ]
-    for mon in monitors:
+    refs = {}
+    for mon in monitors or []:
         if mon.get("name") or mon.get("description"):
-            lines.append(monitor_lua(mon, used))
-    lines.append('hl.monitor({ output = "", mode = "preferred", position = "auto", scale = "auto" })')
-    max_vrr = 0
-    for mon in monitors:
-        if mon.get("enabled", True):
-            max_vrr = max(max_vrr, int(mon.get("vrr") or 0))
-    lines.append("hl.config({ misc = { vrr = %d } })" % max_vrr)
-    lines.append(MANAGED_END)
-    lines.append("")
-    return "\n".join(lines) + "\n"
+            refs[mon.get("name") or ""] = output_ref(mon, used)
+    lines = []
+    for item in plan:
+        output = refs.get(item.get("name") or "")
+        if not output or not item.get("ids"):
+            continue
+        for i, ws in enumerate(item["ids"]):
+            fields = [
+                'workspace = "%d"' % ws,
+                "monitor = %s" % lua_str(output),
+                "persistent = true",
+            ]
+            if i == 0:
+                fields.append("default = true")
+            lines.append("hl.workspace_rule({ %s })" % ", ".join(fields))
+    return lines
 
 
-def backup_file(path):
-    if not os.path.isfile(path):
-        return
-    os.makedirs(BACKUP_DIR, mode=0o700, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    dest = os.path.join(BACKUP_DIR, "monitors.lua.%s" % stamp)
-    shutil.copy2(path, dest)
-    old = sorted(glob.glob(os.path.join(BACKUP_DIR, "monitors.lua.*")))
-    for extra in old[:-8]:
-        try:
-            os.unlink(extra)
-        except OSError:
-            pass
-
-
-def splice_managed(existing, block):
-    if MANAGED_BEGIN in existing and MANAGED_END in existing:
-        pre = existing.split(MANAGED_BEGIN, 1)[0].rstrip()
-        post = existing.split(MANAGED_END, 1)[1].lstrip("\n")
-        return (pre + "\n\n" + block.strip() + "\n" + (post if post.startswith("\n") else "\n" + post)).rstrip() + "\n"
-    return None
-
-
-def write_monitors_lua(monitors):
-    existing = ""
-    if os.path.isfile(MONITORS_LUA):
-        with open(MONITORS_LUA, encoding="utf-8") as fh:
-            existing = fh.read()
-    gdk = read_gdk_scale(existing)
+def managed_block_lines(monitors):
     used = set()
     inner = [MANAGED_BEGIN]
     for mon in monitors:
@@ -912,16 +1282,494 @@ def write_monitors_lua(monitors):
     for mon in monitors:
         if mon.get("enabled", True):
             max_vrr = max(max_vrr, int(mon.get("vrr") or 0))
-    inner.append("hl.config({ misc = { vrr = %d } })" % max_vrr)
+    inner.append(
+        "hl.config({ misc = { vrr = %d }, render = { cm_auto_hdr = %d } })"
+        % (max_vrr, auto_hdr_render(monitors))
+    )
+    store = load_store()
+    if store.get("manageWorkspaces"):
+        inner.extend(workspace_rule_lines(monitors, store.get("primary") or ""))
     inner.append(MANAGED_END)
+    return inner
+
+
+def render_lua(monitors, gdk_scale):
+    lines = [
+        "-- See https://wiki.hypr.land/Configuring/Basics/Monitors/",
+        "-- Managed by im0001gt.screens (Screens bar panel).",
+        "",
+        "local omarchy_gdk_scale = %s" % gdk_scale,
+        'hl.env("GDK_SCALE", tostring(omarchy_gdk_scale))',
+        "",
+    ]
+    lines.extend(managed_block_lines(monitors))
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def looks_managed(text):
+    return MANAGED_BEGIN in (text or "")
+
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+def originals_dir():
+    return os.path.join(BACKUP_DIR, "originals")
+
+
+def originals_manifest_path():
+    return os.path.join(originals_dir(), "manifest.json")
+
+
+def restore_helper_path():
+    return os.path.join(BACKUP_DIR, "restore.sh")
+
+
+def ensure_private_dir(path):
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
+def write_private_file(path, data):
+    ensure_private_dir(os.path.dirname(path) or ".")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(data)
+        fh.flush()
+        try:
+            os.fsync(fh.fileno())
+        except OSError:
+            pass
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return True
+
+
+def write_original_backup(text):
+    write_private_file(ORIGINAL_BACKUP, text)
+    write_private_file(os.path.join(originals_dir(), "monitors.lua"), text)
+    return True
+
+
+def strip_managed_block(text):
+    text = text or ""
+    if MANAGED_BEGIN not in text:
+        return text
+    pre = text.split(MANAGED_BEGIN, 1)[0]
+    post = text.split(MANAGED_END, 1)[1] if MANAGED_END in text else ""
+    return (pre.rstrip() + ("\n" + post.lstrip("\n") if post.strip() else "\n")).lstrip("\n")
+
+
+def leftover_outside_managed(text):
+    """True if monitors.lua still has monitor rules outside the Screens block."""
+    leftover = strip_managed_block(text or "")
+    if re.search(r"hyprmoncfg", leftover, re.I):
+        return True
+    if re.search(r"omarchy_monitor_scale", leftover):
+        return True
+    if re.search(r"hl\.monitor\s*\(", leftover):
+        return True
+    if re.search(r"^\s*monitor\s*=", leftover, re.M):
+        return True
+    return bool((text or "").strip()) and not looks_managed(text)
+
+
+def load_originals_manifest():
+    data = {
+        "version": 1,
+        "files": {},
+        "workspaceLayouts": {},
+        "brightnessLink": {},
+    }
+    try:
+        with open(originals_manifest_path(), encoding="utf-8") as fh:
+            raw = json.load(fh)
+        if isinstance(raw, dict):
+            data["files"] = raw.get("files") if isinstance(raw.get("files"), dict) else {}
+            data["workspaceLayouts"] = (
+                raw.get("workspaceLayouts") if isinstance(raw.get("workspaceLayouts"), dict) else {}
+            )
+            data["brightnessLink"] = (
+                raw.get("brightnessLink") if isinstance(raw.get("brightnessLink"), dict) else {}
+            )
+    except (OSError, json.JSONDecodeError):
+        pass
+    return data
+
+
+def save_originals_manifest(data):
+    write_private_file(originals_manifest_path(), json.dumps(data, indent=2) + "\n")
+
+
+def capture_text_original(key, dest_name, text, present):
+    manifest = load_originals_manifest()
+    files = manifest.setdefault("files", {})
+    if key in files:
+        return False
+    dest = os.path.join(originals_dir(), dest_name)
+    if present and (text or "").strip():
+        write_private_file(dest, text)
+    files[key] = {"present": bool(present and (text or "").strip()), "name": dest_name}
+    save_originals_manifest(manifest)
+    return True
+
+
+def monitors_original_text(text=None):
+    if os.path.isfile(ORIGINAL_BACKUP):
+        return read_text(ORIGINAL_BACKUP)
+    nested = os.path.join(originals_dir(), "monitors.lua")
+    if os.path.isfile(nested):
+        return read_text(nested)
+    if text is None:
+        text = read_text(MONITORS_LUA) if os.path.isfile(MONITORS_LUA) else ""
+    if text.strip() and not looks_managed(text):
+        return text
+    for path in sorted(glob.glob(os.path.join(BACKUP_DIR, STAMPED_BACKUP_GLOB))):
+        body = read_text(path)
+        if body.strip() and not looks_managed(body):
+            return body
+    return text or ""
+
+
+def capture_monitors_original(text=None):
+    if os.path.isfile(ORIGINAL_BACKUP) or os.path.isfile(os.path.join(originals_dir(), "monitors.lua")):
+        if os.path.isfile(ORIGINAL_BACKUP) and not os.path.isfile(os.path.join(originals_dir(), "monitors.lua")):
+            write_private_file(os.path.join(originals_dir(), "monitors.lua"), read_text(ORIGINAL_BACKUP))
+        manifest = load_originals_manifest()
+        if "monitors.lua" not in manifest.get("files", {}):
+            manifest.setdefault("files", {})["monitors.lua"] = {"present": True, "name": "monitors.lua"}
+            save_originals_manifest(manifest)
+        return False
+    body = monitors_original_text(text)
+    if not (body or "").strip():
+        capture_text_original("monitors.lua", "monitors.lua", "", False)
+        return False
+    write_original_backup(body)
+    manifest = load_originals_manifest()
+    manifest.setdefault("files", {})["monitors.lua"] = {"present": True, "name": "monitors.lua"}
+    save_originals_manifest(manifest)
+    return True
+
+
+def capture_bindings_original():
+    dest = os.path.join(originals_dir(), "bindings.lua")
+    if os.path.isfile(dest):
+        return False
+    present = os.path.isfile(BINDINGS_LUA)
+    text = read_text(BINDINGS_LUA) if present else ""
+    if looks_managed(text):
+        text = strip_managed_block(text)
+    return capture_text_original("bindings.lua", "bindings.lua", text, present)
+
+
+def reconstructed_shell_original():
+    config = load_shell_json()
+    if not config:
+        return "", False
+    section, index, eid, entry = find_workspaces_slot(config)
+    store = load_store()
+    if eid == OUR_WS_WIDGET:
+        old_id = store.get("workspacesBarId") or STOCK_WS_WIDGET
+        if isinstance(entry, str):
+            config["bar"]["layout"][section][index] = old_id
+        elif isinstance(entry, dict):
+            next_entry = dict(entry)
+            next_entry["id"] = old_id
+            config["bar"]["layout"][section][index] = next_entry
+    return json.dumps(config, indent=2) + "\n", True
+
+
+def capture_shell_original():
+    dest = os.path.join(originals_dir(), "shell.json")
+    if os.path.isfile(dest):
+        return False
+    if not os.path.isfile(SHELL_JSON):
+        return capture_text_original("shell.json", "shell.json", "", False)
+    text = read_text(SHELL_JSON)
+    if OUR_WS_WIDGET in text:
+        reconstructed, present = reconstructed_shell_original()
+        if present:
+            text = reconstructed
+    return capture_text_original("shell.json", "shell.json", text, True)
+
+
+def capture_workspace_layouts():
+    manifest = load_originals_manifest()
+    layouts = manifest.setdefault("workspaceLayouts", {})
+    changed = False
+    layout_dir = os.path.join(originals_dir(), "workspace-layouts")
+    for i in range(1, WORKSPACE_COUNT + 1):
+        key = str(i)
+        if key in layouts:
+            continue
+        src = os.path.join(LAYOUTS_DIR, "%d.lua" % i)
+        if os.path.isfile(src):
+            write_private_file(os.path.join(layout_dir, "%d.lua" % i), read_text(src))
+            layouts[key] = "present"
+        else:
+            layouts[key] = "absent"
+        changed = True
+    if changed:
+        save_originals_manifest(manifest)
+    return changed
+
+
+def capture_brightness_link():
+    manifest = load_originals_manifest()
+    if manifest.get("brightnessLink"):
+        return False
+    path = BRIGHTNESS_LINK
+    info = {"path": path, "state": "absent", "previous": ""}
+    if os.path.islink(path):
+        previous = os.readlink(path)
+        if "im0001gt.screens" in previous:
+            info["state"] = "absent"
+            info["previous"] = ""
+        else:
+            info["state"] = "replaced"
+            info["previous"] = previous
+    elif os.path.exists(path):
+        info["state"] = "replaced"
+        info["previous"] = ""
+    else:
+        info["state"] = "absent"
+    manifest["brightnessLink"] = info
+    save_originals_manifest(manifest)
+    return True
+
+
+def write_restore_helper():
+    script = """#!/bin/bash
+# First-install restore for Screens. Lives outside the plugin so it still
+# works after: omarchy plugin remove im0001gt.screens
+set -euo pipefail
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/im0001gt.screens"
+ORIG="$STATE/originals"
+MANIFEST="$ORIG/manifest.json"
+if [[ ! -f $MANIFEST ]]; then
+  echo "restore: no first-install snapshot at $ORIG" >&2
+  exit 2
+fi
+python3 - "$ORIG" "$MANIFEST" <<'PY'
+import json, os, shutil, sys
+orig, manifest_path = sys.argv[1], sys.argv[2]
+home = os.path.expanduser("~")
+with open(manifest_path, encoding="utf-8") as fh:
+    manifest = json.load(fh)
+files = {
+    "monitors.lua": os.path.join(home, ".config/hypr/monitors.lua"),
+    "bindings.lua": os.path.join(home, ".config/hypr/bindings.lua"),
+    "shell.json": os.path.join(home, ".config/omarchy/shell.json"),
+}
+for key, dest in files.items():
+    meta = (manifest.get("files") or {}).get(key) or {}
+    src = os.path.join(orig, meta.get("name") or key)
+    if meta.get("present") and os.path.isfile(src):
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copy2(src, dest)
+    elif meta and not meta.get("present") and os.path.isfile(dest) and key != "shell.json":
+        if key == "bindings.lua":
+            pass
+layouts = os.path.join(home, ".local/state/omarchy/workspace-layouts")
+for key, state in (manifest.get("workspaceLayouts") or {}).items():
+    dest = os.path.join(layouts, "%s.lua" % key)
+    src = os.path.join(orig, "workspace-layouts", "%s.lua" % key)
+    if state == "present" and os.path.isfile(src):
+        os.makedirs(layouts, exist_ok=True)
+        shutil.copy2(src, dest)
+    elif state == "absent" and os.path.isfile(dest):
+        os.unlink(dest)
+link = manifest.get("brightnessLink") or {}
+path = os.path.expanduser(link.get("path") or "")
+if path:
+    previous = link.get("previous") or ""
+    if link.get("state") == "absent" and os.path.islink(path):
+        os.unlink(path)
+    elif link.get("state") == "replaced" and previous:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.lexists(path):
+            os.unlink(path)
+        os.symlink(previous, path)
+print("Restored first-install Hyprland and Omarchy files from", orig)
+PY
+hyprctl reload >/dev/null 2>&1 || true
+"""
+    ensure_private_dir(BACKUP_DIR)
+    path = restore_helper_path()
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(script)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    return path
+
+
+def ensure_stock_backups(monitors_text=None):
+    """Snapshot every stock file Screens may change. Never overwrite."""
+    ensure_private_dir(BACKUP_DIR)
+    ensure_private_dir(originals_dir())
+    capture_monitors_original(monitors_text)
+    capture_bindings_original()
+    capture_shell_original()
+    capture_workspace_layouts()
+    capture_brightness_link()
+    write_restore_helper()
+    return os.path.isfile(ORIGINAL_BACKUP) or os.path.isfile(
+        os.path.join(originals_dir(), "monitors.lua")
+    )
+
+
+def ensure_original_backup(text=None):
+    """Snapshot monitors.lua once, before Screens writes it. Never overwrite."""
+    return ensure_stock_backups(monitors_text=text)
+
+
+def backup_file(path):
+    if not os.path.isfile(path):
+        return
+    ensure_private_dir(BACKUP_DIR)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dest = os.path.join(BACKUP_DIR, "monitors.lua.%s" % stamp)
+    shutil.copy2(path, dest)
+    old = sorted(glob.glob(os.path.join(BACKUP_DIR, STAMPED_BACKUP_GLOB)))
+    for extra in old[:-8]:
+        try:
+            os.unlink(extra)
+        except OSError:
+            pass
+
+
+def restore_stock_file(dest, src, present):
+    if present and os.path.isfile(src):
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copy2(src, dest)
+        return True
+    return False
+
+
+def restore_original():
+    ensure_stock_backups()
+    orig = originals_dir()
+    manifest = load_originals_manifest()
+    restored = []
+    monitors_src = os.path.join(orig, "monitors.lua")
+    if not os.path.isfile(monitors_src) and os.path.isfile(ORIGINAL_BACKUP):
+        monitors_src = ORIGINAL_BACKUP
+    if os.path.isfile(monitors_src):
+        if os.path.isfile(MONITORS_LUA):
+            backup_file(MONITORS_LUA)
+        os.makedirs(os.path.dirname(MONITORS_LUA), exist_ok=True)
+        shutil.copy2(monitors_src, MONITORS_LUA)
+        restored.append(MONITORS_LUA)
+    files = manifest.get("files") or {}
+    bindings_meta = files.get("bindings.lua") or {}
+    if restore_stock_file(
+        BINDINGS_LUA,
+        os.path.join(orig, bindings_meta.get("name") or "bindings.lua"),
+        bindings_meta.get("present", os.path.isfile(os.path.join(orig, "bindings.lua"))),
+    ):
+        restored.append(BINDINGS_LUA)
+    elif os.path.isfile(BINDINGS_LUA) and looks_managed(read_text(BINDINGS_LUA)):
+        write_private_file(BINDINGS_LUA, strip_managed_block(read_text(BINDINGS_LUA)))
+        restored.append(BINDINGS_LUA)
+    shell_meta = files.get("shell.json") or {}
+    if restore_stock_file(
+        SHELL_JSON,
+        os.path.join(orig, shell_meta.get("name") or "shell.json"),
+        shell_meta.get("present", os.path.isfile(os.path.join(orig, "shell.json"))),
+    ):
+        restored.append(SHELL_JSON)
+    for key, state in (manifest.get("workspaceLayouts") or {}).items():
+        dest = os.path.join(LAYOUTS_DIR, "%s.lua" % key)
+        src = os.path.join(orig, "workspace-layouts", "%s.lua" % key)
+        if state == "present" and os.path.isfile(src):
+            os.makedirs(LAYOUTS_DIR, exist_ok=True)
+            shutil.copy2(src, dest)
+            restored.append(dest)
+        elif state == "absent" and os.path.isfile(dest):
+            os.unlink(dest)
+            restored.append(dest)
+    link = manifest.get("brightnessLink") or {}
+    path = os.path.expanduser(link.get("path") or BRIGHTNESS_LINK)
+    previous = link.get("previous") or ""
+    if link.get("state") == "absent" and os.path.islink(path):
+        os.unlink(path)
+        restored.append(path)
+    elif link.get("state") == "replaced" and previous:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.lexists(path):
+            os.unlink(path)
+        os.symlink(previous, path)
+        restored.append(path)
+    reload_hypr()
+    if not restored:
+        print("restore-original: no first-install snapshot at %s" % orig, file=sys.stderr)
+        return 2
+    print("Restored pre-Screens files:")
+    for item in restored:
+        print("  %s" % item)
+    return 0
+
+
+def splice_managed(existing, block):
+    if MANAGED_BEGIN in existing and MANAGED_END in existing:
+        pre = existing.split(MANAGED_BEGIN, 1)[0].rstrip()
+        post = existing.split(MANAGED_END, 1)[1].lstrip("\n")
+        return (pre + "\n\n" + block.strip() + "\n" + (post if post.startswith("\n") else "\n" + post)).rstrip() + "\n"
+    return None
+
+
+def gdk_from_monitors(monitors, fallback="2"):
+    scales = []
+    for mon in monitors or []:
+        if not mon.get("enabled", True):
+            continue
+        try:
+            scales.append(float(mon.get("scale") or 1))
+        except (TypeError, ValueError):
+            pass
+    if not scales:
+        return str(fallback)
+    return str(max(1, int(round(max(scales)))))
+
+
+def write_monitors_lua(monitors, gdk=None):
+    existing = ""
+    if os.path.isfile(MONITORS_LUA):
+        with open(MONITORS_LUA, encoding="utf-8") as fh:
+            existing = fh.read()
+    if gdk is None:
+        if re.search(r"omarchy_gdk_scale\s*=", existing or ""):
+            gdk = read_gdk_scale(existing)
+        else:
+            gdk = gdk_from_monitors(monitors, "2")
+    inner = managed_block_lines(monitors)
     block = "\n".join(inner) + "\n"
     spliced = splice_managed(existing, block)
-    if spliced is not None:
-        text = spliced
-    elif re.search(r'output\s*=\s*""\s*,\s*mode\s*=\s*"preferred"', existing) and existing.count("hl.monitor") <= 2:
+    if leftover_outside_managed(existing) or spliced is None:
         text = render_lua(monitors, gdk)
     else:
-        text = (existing.rstrip() + "\n\n" + block) if existing.strip() else render_lua(monitors, gdk)
+        text = spliced
+        text = re.sub(
+            r"local omarchy_gdk_scale = [0-9.]+",
+            "local omarchy_gdk_scale = %s" % gdk,
+            text,
+            count=1,
+        )
+    ensure_original_backup(existing)
     backup_file(MONITORS_LUA)
     os.makedirs(os.path.dirname(MONITORS_LUA), exist_ok=True)
     tmp = MONITORS_LUA + ".tmp"
@@ -929,6 +1777,284 @@ def write_monitors_lua(monitors):
         fh.write(text)
     os.replace(tmp, MONITORS_LUA)
     return text
+
+
+def process_named(name):
+    try:
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(os.path.join("/proc", pid, "comm"), encoding="utf-8") as fh:
+                    comm = fh.read().strip()
+            except OSError:
+                continue
+            if comm == name:
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def user_unit_wanted(unit):
+    wants = os.path.expanduser("~/.config/systemd/user/default.target.wants")
+    return os.path.lexists(os.path.join(wants, unit))
+
+
+def plugin_enabled(plugin_id):
+    out = run(["omarchy-plugin-list", "--json"], timeout=8)
+    if not out or out.returncode != 0 or not (out.stdout or "").strip():
+        return False
+    try:
+        items = json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(items, list):
+        return False
+    for item in items:
+        if isinstance(item, dict) and item.get("id") == plugin_id:
+            return bool(item.get("enabled", True))
+    return False
+
+
+_conflict_cache = {"at": 0.0, "info": None}
+
+
+def conflict_message(info):
+    bits = []
+    if info.get("plugin") or info.get("enabled"):
+        bits.append("the crmne.hyprmoncfg plugin")
+    if info.get("daemon"):
+        bits.append("the hyprmoncfgd daemon")
+    if info.get("package") and not bits:
+        bits.append("the hyprmoncfg package")
+    who = " and ".join(bits) if bits else "hyprmoncfg"
+    if info.get("blocking"):
+        extra = (
+            "It stays in control of screen settings until you remove it. "
+            "Screens will yield until then, and will not disable it for you. "
+        )
+    else:
+        extra = (
+            "Remove it if you are not using it. Screens will not disable it for you. "
+        )
+    return (
+        "Found %s. %s"
+        "Use: omarchy plugin remove crmne.hyprmoncfg — "
+        "and stop hyprmoncfgd yourself if it is still running."
+        % (who, extra)
+    )
+
+
+def detect_conflicts():
+    now = time.time()
+    cached = _conflict_cache.get("info")
+    if cached is not None and now - float(_conflict_cache.get("at") or 0) < 15:
+        return cached
+    plugin = os.path.isdir(HYPRMONCFG_PLUGIN_DIR)
+    enabled = plugin_enabled(HYPRMONCFG_PLUGIN_ID) if plugin else False
+    daemon_running = process_named(HYPRMONCFG_DAEMON)
+    daemon_wanted = user_unit_wanted(HYPRMONCFG_UNIT)
+    package = bool(shutil.which(HYPRMONCFG_DAEMON) or shutil.which("hyprmoncfg"))
+    blocking = bool(enabled or daemon_running or daemon_wanted)
+    present = bool(plugin or blocking or package)
+    info = {
+        "id": HYPRMONCFG_PLUGIN_ID,
+        "name": "hyprmoncfg",
+        "plugin": plugin,
+        "enabled": enabled,
+        "daemon": daemon_running or daemon_wanted,
+        "daemonActive": daemon_running,
+        "package": package,
+        "blocking": blocking,
+        "present": present,
+        "message": conflict_message({
+            "plugin": plugin,
+            "enabled": enabled,
+            "daemon": daemon_running or daemon_wanted,
+            "package": package,
+            "blocking": blocking,
+        }) if (blocking or plugin) else "",
+    }
+    _conflict_cache["at"] = now
+    _conflict_cache["info"] = info
+    return info
+
+
+def public_conflict(info):
+    if not info or not (info.get("blocking") or info.get("plugin")):
+        return None
+    return {
+        "id": info.get("id") or "",
+        "name": info.get("name") or "hyprmoncfg",
+        "plugin": bool(info.get("plugin")),
+        "enabled": bool(info.get("enabled")),
+        "daemon": bool(info.get("daemon")),
+        "package": bool(info.get("package")),
+        "blocking": bool(info.get("blocking")),
+        "message": info.get("message") or "",
+    }
+
+
+def scale_bindings_block():
+    path = CTL_PATH.replace("\\", "\\\\").replace('"', '\\"')
+    return "\n".join([
+        MANAGED_BEGIN,
+        'hl.unbind("SUPER + SLASH")',
+        'hl.unbind("SUPER + ALT + SLASH")',
+        'o.bind("SUPER + SLASH", "Monitor scaling up", "%s scale up")' % path,
+        'o.bind("SUPER + ALT + SLASH", "Monitor scaling down", "%s scale down")' % path,
+        MANAGED_END,
+        "",
+    ])
+
+
+def install_scale_bindings():
+    ensure_stock_backups()
+    existing = read_text(BINDINGS_LUA)
+    block = scale_bindings_block()
+    if looks_managed(existing) and CTL_PATH in existing and "scale up" in existing:
+        return False
+    if looks_managed(existing):
+        text = splice_managed(existing, block) or (existing.rstrip() + "\n\n" + block)
+    elif existing.strip():
+        text = existing.rstrip() + "\n\n" + block
+    else:
+        text = (
+            "-- Screens restores Omarchy's monitor scale keys after it takes over monitors.lua.\n\n"
+            + block
+        )
+    os.makedirs(os.path.dirname(BINDINGS_LUA), exist_ok=True)
+    tmp = BINDINGS_LUA + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text if text.endswith("\n") else text + "\n")
+    os.replace(tmp, BINDINGS_LUA)
+    return True
+
+
+def gcd_int(a, b):
+    a, b = abs(int(a)), abs(int(b))
+    while b:
+        a, b = b, a % b
+    return a or 1
+
+
+def hypr_clean_scale(scale, width, height):
+    try:
+        scale = float(scale)
+        width = float(width)
+        height = float(height)
+    except (TypeError, ValueError):
+        return 1.0
+    if scale <= 0 or width <= 0 or height <= 0:
+        return 1.0
+    g = gcd_int(round(width * 120), round(height * 120))
+    k = int(round(scale * 120))
+    if k < 1:
+        k = 1
+    if k > g:
+        k = g
+    while g % k != 0:
+        k += 1
+        if k > g:
+            return g / 120.0
+    value = k / 120.0
+    text = ("%.6f" % value).rstrip("0").rstrip(".")
+    return float(text) if text else 1.0
+
+
+def next_scale_preset(current, width, height, direction):
+    unique = []
+    seen = {}
+    for preset in SCALE_PRESETS:
+        effective = hypr_clean_scale(preset, width, height)
+        key = round(effective, 8)
+        dist = abs(preset - effective)
+        if key not in seen:
+            seen[key] = len(unique)
+            unique.append((preset, dist, effective))
+        elif dist < unique[seen[key]][1]:
+            unique[seen[key]] = (preset, dist, effective)
+    if not unique:
+        return 1
+    try:
+        current = float(current)
+    except (TypeError, ValueError):
+        current = unique[0][2]
+    best = min(range(len(unique)), key=lambda i: abs(unique[i][2] - current))
+    if direction in ("up", "next"):
+        best = min(best + 1, len(unique) - 1)
+    elif direction in ("down", "previous"):
+        best = max(best - 1, 0)
+    return unique[best][0]
+
+
+def scale_step(requested):
+    data = snapshot()
+    monitors = data.get("monitors") or []
+    focused = next((m for m in monitors if m.get("focused") and m.get("enabled")), None)
+    if focused is None:
+        focused = next((m for m in monitors if m.get("enabled")), None)
+    if focused is None:
+        print("scale: no enabled display", file=sys.stderr)
+        return 1
+    width = focused.get("width") or 0
+    height = focused.get("height") or 0
+    current = focused.get("scale") or 1
+    action = str(requested or "").strip().lower()
+    if action in ("up", "next", "down", "previous"):
+        preset = next_scale_preset(current, width, height, action)
+    else:
+        try:
+            preset = float(requested)
+        except (TypeError, ValueError):
+            print("scale: up|down|SCALE", file=sys.stderr)
+            return 2
+        if preset < 1 or preset > 4:
+            print("scale: expected 1–4", file=sys.stderr)
+            return 2
+    focused["scale"] = hypr_clean_scale(preset, width, height)
+    focused["logicalW"], focused["logicalH"] = logical_size(
+        focused.get("width"),
+        focused.get("height"),
+        focused.get("scale"),
+        focused.get("transform"),
+    )
+    gdk = str(max(1, int(round(float(focused["scale"])))))
+    return apply({"monitors": monitors}, gdk=gdk)
+
+
+def claim_monitors(force=False):
+    existing = read_text(MONITORS_LUA) if os.path.isfile(MONITORS_LUA) else ""
+    ensure_original_backup(existing)
+    bindings_changed = install_scale_bindings()
+    store = load_store()
+    conflicts = detect_conflicts()
+    leftover = leftover_outside_managed(existing)
+    should_write = force or leftover or not looks_managed(existing) or not store.get("claimedMonitors")
+    wrote = False
+    if should_write and not conflicts.get("blocking"):
+        data = snapshot()
+        monitors = data.get("monitors") or []
+        if monitors:
+            write_monitors_lua(monitors)
+            wrote = True
+        store = load_store()
+        store["claimedMonitors"] = True
+        save_store(store)
+    elif not conflicts.get("blocking"):
+        store["claimedMonitors"] = True
+        save_store(store)
+    if wrote or bindings_changed:
+        reload_hypr()
+    return {
+        "ok": True,
+        "wrote": wrote,
+        "original": os.path.isfile(ORIGINAL_BACKUP),
+        "bindings": True,
+        "conflict": public_conflict(conflicts),
+        "claimedMonitors": True if not conflicts.get("blocking") else bool(store.get("claimedMonitors")),
+    }
 
 
 def config_errors():
@@ -943,7 +2069,7 @@ def reload_hypr():
     time.sleep(0.15)
 
 
-def apply(payload):
+def apply(payload, gdk=None):
     monitors = payload.get("monitors") if isinstance(payload, dict) else None
     if not isinstance(monitors, list) or not monitors:
         print("apply: expected {\"monitors\": [...]}", file=sys.stderr)
@@ -958,13 +2084,18 @@ def apply(payload):
     if os.path.isfile(MONITORS_LUA):
         with open(MONITORS_LUA, encoding="utf-8") as fh:
             prev = fh.read()
-    write_monitors_lua(monitors)
+    write_monitors_lua(monitors, gdk=gdk)
     reload_hypr()
     max_vrr = 0
     for mon in monitors:
         if mon.get("enabled", True):
             max_vrr = max(max_vrr, int(mon.get("vrr") or 0))
-    run(["hyprctl", "eval", "hl.config({ misc = { vrr = %d } })" % max_vrr])
+    run([
+        "hyprctl",
+        "eval",
+        "hl.config({ misc = { vrr = %d }, render = { cm_auto_hdr = %d } })"
+        % (max_vrr, auto_hdr_render(monitors)),
+    ])
     errors = config_errors()
     if errors:
         if prev:
@@ -976,6 +2107,10 @@ def apply(payload):
     prev_store = load_store()
     remember_layout(monitors)
     wake_new_outputs(monitors, prev_store)
+    if load_store().get("manageWorkspaces"):
+        pin_and_save_plan(monitors)
+    else:
+        write_workspaces_json(False, [], load_store().get("workspaceLayouts") or {})
     print(json.dumps(snapshot(), separators=(",", ":")))
     return 0
 
@@ -1026,7 +2161,15 @@ def profile_entry_from_monitor(mon):
         "scale": mon.get("scale") if mon.get("scale") not in (None, "") else 1,
         "transform": int(mon.get("transform") or 0),
         "vrr": int(mon.get("vrr") or 0),
-        "hdr": bool(mon.get("hdr")),
+        "hdr": hdr_mode(mon) == 2,
+        "hdrMode": hdr_mode(mon),
+        "bitdepth": clean_bitdepth(mon.get("bitdepth"), 10),
+        "cm": clean_cm(mon.get("cm")),
+        "sdrMinLuminance": clean_float(mon.get("sdrMinLuminance"), 0.0, 1.0, 0.005),
+        "sdrMaxLuminance": clean_int(mon.get("sdrMaxLuminance"), 40, 1000, 200),
+        "sdrBrightness": clean_float(mon.get("sdrBrightness"), 0.5, 2.5, 1.0),
+        "minLuminance": clean_float(mon.get("minLuminance"), 0.0, 10.0, -1),
+        "maxLuminance": clean_int(mon.get("maxLuminance"), -1, 10000, -1),
         "enabled": bool(mon.get("enabled", True)),
         "mirror": mon.get("mirror") or "",
     }
@@ -1041,7 +2184,11 @@ def merge_profile(profile, live):
             merged.append(live_m)
             continue
         item = dict(live_m)
-        for key in ("mode", "x", "y", "scale", "transform", "vrr", "hdr", "enabled", "mirror"):
+        for key in (
+            "mode", "x", "y", "scale", "transform", "vrr", "hdr",
+            "hdrMode", "bitdepth", "cm", "sdrMinLuminance", "sdrMaxLuminance",
+            "sdrBrightness", "minLuminance", "maxLuminance", "enabled", "mirror",
+        ):
             if key in rule:
                 item[key] = rule[key]
         # Profile mirror is stored as identity; Hyprland wants a connector.
@@ -1114,10 +2261,337 @@ def set_auto(value):
     return 0
 
 
+def read_workspaces_json():
+    try:
+        with open(WORKSPACES_JSON, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def workspace_labels_from(data=None):
+    if data is None:
+        data = read_workspaces_json()
+    labels = data.get("labels")
+    return labels if isinstance(labels, dict) else {}
+
+
+def parse_workspace_icon(raw):
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    m = re.match(r"^(?:u\+|0x|\\\\u)?([0-9a-f]{4,6})$", text, re.I)
+    if m:
+        cp = int(m.group(1), 16)
+        if 0 < cp <= 0x10FFFF:
+            return chr(cp)
+        return ""
+    return text[0]
+
+
+def write_workspaces_json(enabled, plan, layouts, labels=None):
+    os.makedirs(BACKUP_DIR, mode=0o700, exist_ok=True)
+    if labels is None:
+        labels = workspace_labels_from()
+    data = {
+        "enabled": bool(enabled),
+        "total": WORKSPACE_COUNT,
+        "layouts": layouts or {},
+        "monitors": plan or [],
+        "labels": labels,
+    }
+    tmp = WORKSPACES_JSON + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, WORKSPACES_JSON)
+
+
+def pin_workspaces(plan):
+    live = hypr_json(["monitors"]) or []
+    focused = ""
+    focused_ws = ""
+    for mon in live:
+        if mon.get("focused"):
+            focused = mon.get("name") or ""
+            active = mon.get("activeWorkspace") or {}
+            if active.get("id"):
+                focused_ws = str(active.get("id"))
+            break
+    for item in plan or []:
+        dest = clean_connector(item.get("name"))
+        ids = item.get("ids") or []
+        if not dest or not ids:
+            continue
+        for ws in ids:
+            hypr_dispatch(
+                "hl.dsp.workspace.move({ workspace = %s, monitor = %s })"
+                % (lua_str(str(ws)), lua_str(dest))
+            )
+    if focused:
+        hypr_dispatch("hl.dsp.focus({ monitor = %s })" % lua_str(focused))
+        if focused_ws:
+            hypr_dispatch("hl.dsp.focus({ workspace = %s })" % lua_str(focused_ws))
+
+
+def pin_and_save_plan(monitors):
+    store = load_store()
+    plan = workspace_plan(monitors, store.get("primary") or "")
+    write_workspaces_json(True, plan, store.get("workspaceLayouts") or {})
+    pin_workspaces(plan)
+    for ws_id, mode in (store.get("workspaceLayouts") or {}).items():
+        try:
+            apply_layout_live(int(ws_id), mode)
+        except (TypeError, ValueError):
+            continue
+
+
+def bar_entry_id(entry):
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        return str(entry.get("id") or "")
+    return ""
+
+
+def find_workspaces_slot(config):
+    layout = ((config.get("bar") or {}).get("layout") or {})
+    for section in ("left", "center", "right"):
+        entries = layout.get(section) or []
+        if not isinstance(entries, list):
+            continue
+        for i, entry in enumerate(entries):
+            eid = bar_entry_id(entry)
+            if eid.endswith(".workspaces"):
+                return section, i, eid, entry
+    return None, None, "", None
+
+
+def load_shell_json():
+    try:
+        with open(SHELL_JSON, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            return data
+    except (OSError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def save_shell_json(data):
+    tmp = SHELL_JSON + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, SHELL_JSON)
+
+
+def swap_bar_workspaces(enable):
+    ensure_stock_backups()
+    config = load_shell_json()
+    if not config:
+        return
+    section, index, eid, entry = find_workspaces_slot(config)
+    if section is None:
+        return
+    store = load_store()
+    if enable:
+        if eid == OUR_WS_WIDGET:
+            return
+        store["workspacesBarId"] = eid or STOCK_WS_WIDGET
+        save_store(store)
+        new_id = OUR_WS_WIDGET
+    else:
+        if eid != OUR_WS_WIDGET:
+            return
+        new_id = store.get("workspacesBarId") or STOCK_WS_WIDGET
+        if new_id == OUR_WS_WIDGET:
+            new_id = STOCK_WS_WIDGET
+    if isinstance(entry, str):
+        config["bar"]["layout"][section][index] = new_id
+    elif isinstance(entry, dict):
+        next_entry = dict(entry)
+        next_entry["id"] = new_id
+        config["bar"]["layout"][section][index] = next_entry
+    else:
+        return
+    save_shell_json(config)
+
+
+def snapshot_monitors_for_write():
+    live = snapshot()["monitors"]
+    known = {clean_connector(m.get("name")) for m in live if clean_connector(m.get("name"))}
+    return [sanitize_monitor(m, known) for m in live]
+
+
+def set_manage_workspaces(on):
+    store = load_store()
+    store["manageWorkspaces"] = bool(on)
+    save_store(store)
+    live = snapshot_monitors_for_write()
+    write_monitors_lua(live)
+    reload_hypr()
+    if on:
+        pin_and_save_plan(live)
+        swap_bar_workspaces(True)
+    else:
+        write_workspaces_json(False, [], store.get("workspaceLayouts") or {})
+        swap_bar_workspaces(False)
+    print(json.dumps(snapshot(), separators=(",", ":")))
+    return 0
+
+
+def sync_workspaces():
+    store = load_store()
+    if not store.get("manageWorkspaces"):
+        print(json.dumps(snapshot(), separators=(",", ":")))
+        return 0
+    live = snapshot_monitors_for_write()
+    write_monitors_lua(live)
+    reload_hypr()
+    pin_and_save_plan(live)
+    print(json.dumps(snapshot(), separators=(",", ":")))
+    return 0
+
+
+def write_layout_file(ws_id, mode):
+    ensure_stock_backups()
+    os.makedirs(LAYOUTS_DIR, mode=0o700, exist_ok=True)
+    path = os.path.join(LAYOUTS_DIR, "%d.lua" % ws_id)
+    hypr_layout = "scrolling" if mode == "scroll" else "dwindle"
+    lines = [
+        'hl.workspace_rule({ workspace = "%d", layout = "%s" })' % (ws_id, hypr_layout),
+    ]
+    if mode == "float":
+        lines.append(
+            'hl.window_rule({ name = %s, match = { workspace = "%d" }, float = true })'
+            % (lua_str("im0001gt.screens-float-%d" % ws_id), ws_id)
+        )
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+
+
+def float_windows_on_workspace(ws_id, floating):
+    clients = hypr_json(["clients"]) or []
+    action = "on" if floating else "off"
+    for client in clients:
+        ws = client.get("workspace") or {}
+        try:
+            cid = int(ws.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if cid != ws_id:
+            continue
+        addr = str(client.get("address") or "")
+        if not addr:
+            continue
+        if not addr.startswith("address:"):
+            addr = "address:%s" % addr
+        hypr_dispatch(
+            "hl.dsp.window.float({ action = %s, window = %s })"
+            % (lua_str(action), lua_str(addr))
+        )
+
+
+def apply_layout_live(ws_id, mode):
+    hypr_layout = "scrolling" if mode == "scroll" else "dwindle"
+    run(
+        [
+            "hyprctl",
+            "eval",
+            'hl.workspace_rule({ workspace = "%d", layout = "%s" })' % (ws_id, hypr_layout),
+        ]
+    )
+    rule_name = "im0001gt.screens-float-%d" % ws_id
+    if mode == "float":
+        run(
+            [
+                "hyprctl",
+                "eval",
+                "hl.window_rule({ name = %s, match = { workspace = \"%d\" }, float = true })"
+                % (lua_str(rule_name), ws_id),
+            ]
+        )
+        float_windows_on_workspace(ws_id, True)
+        return
+    run(
+        [
+            "hyprctl",
+            "eval",
+            "hl.window_rule({ name = %s, match = { workspace = \"%d\" }, tile = true })"
+            % (lua_str(rule_name), ws_id),
+        ]
+    )
+    float_windows_on_workspace(ws_id, False)
+
+
+def set_workspace_layout(ws_id, mode):
+    try:
+        ws_id = int(ws_id)
+    except (TypeError, ValueError):
+        print("workspace-layout: workspace must be 1-10", file=sys.stderr)
+        return 2
+    if ws_id < 1 or ws_id > WORKSPACE_COUNT:
+        print("workspace-layout: workspace must be 1-10", file=sys.stderr)
+        return 2
+    mode = clean_workspace_layout(mode)
+    if not mode:
+        print("workspace-layout: tile|scroll|float", file=sys.stderr)
+        return 2
+    store = load_store()
+    layouts = dict(store.get("workspaceLayouts") or {})
+    layouts[str(ws_id)] = mode
+    store["workspaceLayouts"] = layouts
+    save_store(store)
+    write_layout_file(ws_id, mode)
+    apply_layout_live(ws_id, mode)
+    if store.get("manageWorkspaces"):
+        live = snapshot()["monitors"]
+        write_workspaces_json(True, workspace_plan(live, store.get("primary") or ""), layouts)
+    else:
+        write_workspaces_json(False, [], layouts)
+    print(json.dumps(snapshot(), separators=(",", ":")))
+    return 0
+
+
+def set_workspace_label(ws_id, name="", icon=""):
+    try:
+        n = int(str(ws_id).strip())
+    except (TypeError, ValueError):
+        n = 0
+    if n < 1 or n > WORKSPACE_COUNT:
+        print("workspace-label: workspace must be 1-10", file=sys.stderr)
+        return 2
+    data = read_workspaces_json()
+    labels = dict(workspace_labels_from(data))
+    name = " ".join(str(name or "").split())[:48]
+    icon = parse_workspace_icon(icon)
+    key = str(n)
+    if not name and not icon:
+        labels.pop(key, None)
+    else:
+        labels[key] = {"name": name, "icon": icon}
+    write_workspaces_json(
+        bool(data.get("enabled")),
+        data.get("monitors") if isinstance(data.get("monitors"), list) else [],
+        data.get("layouts") if isinstance(data.get("layouts"), dict) else {},
+        labels,
+    )
+    return 0
+
+
 def set_primary(identity):
     store = load_store()
     store["primary"] = (identity or "").strip()
     save_store(store)
+    if store.get("manageWorkspaces"):
+        live = snapshot()["monitors"]
+        write_monitors_lua(live)
+        reload_hypr()
+        pin_and_save_plan(live)
     print(json.dumps(snapshot(), separators=(",", ":")))
     return 0
 
@@ -1177,6 +2651,16 @@ def main(argv):
     if cmd == "state":
         print(json.dumps(snapshot(), separators=(",", ":")))
         return 0
+    if cmd == "backup-original":
+        ensure_stock_backups()
+        orig = originals_dir()
+        if os.path.isdir(orig):
+            print(orig)
+            return 0
+        print("backup-original: could not snapshot stock files", file=sys.stderr)
+        return 1
+    if cmd == "restore-original":
+        return restore_original()
     if cmd == "apply":
         raw = argv[1] if len(argv) > 1 else sys.stdin.read()
         try:
@@ -1210,6 +2694,27 @@ def main(argv):
             return set_primary(argv[2] if len(argv) > 2 else "")
         print("profile: unknown action: %s" % action, file=sys.stderr)
         return 2
+    if cmd == "workspaces":
+        action = argv[1] if len(argv) > 1 else ""
+        if action in ("on", "1", "true"):
+            return set_manage_workspaces(True)
+        if action in ("off", "0", "false"):
+            return set_manage_workspaces(False)
+        if action == "sync":
+            return sync_workspaces()
+        print("workspaces: on|off|sync", file=sys.stderr)
+        return 2
+    if cmd == "workspace-layout":
+        return set_workspace_layout(
+            argv[1] if len(argv) > 1 else "",
+            argv[2] if len(argv) > 2 else "",
+        )
+    if cmd == "workspace-label":
+        return set_workspace_label(
+            argv[1] if len(argv) > 1 else "",
+            argv[2] if len(argv) > 2 else "",
+            argv[3] if len(argv) > 3 else "",
+        )
     if cmd == "idle":
         action = argv[1] if len(argv) > 1 else ""
         if action == "off":
@@ -1220,6 +2725,34 @@ def main(argv):
             return notice_seen()
         print("idle: off|on|notice", file=sys.stderr)
         return 2
+    if cmd == "claim":
+        print(json.dumps(claim_monitors(), separators=(",", ":")))
+        return 0
+    if cmd == "conflicts":
+        action = argv[1] if len(argv) > 1 else ""
+        if action in ("remove", "uninstall"):
+            print(
+                "conflicts: Screens does not remove other plugins. "
+                "Remove hyprmoncfg yourself.",
+                file=sys.stderr,
+            )
+            return 2
+        info = detect_conflicts()
+        payload = public_conflict(info) or {"present": False, "blocking": False}
+        if action in ("--check", "check"):
+            if info.get("blocking") or info.get("plugin"):
+                print(json.dumps(payload, separators=(",", ":")))
+                return 1
+            return 0
+        print(json.dumps(payload, separators=(",", ":")))
+        return 1 if (info.get("blocking") or info.get("plugin")) else 0
+    if cmd == "bar-care":
+        return set_bar_care(
+            argv[1] if len(argv) > 1 else "",
+            argv[2] if len(argv) > 2 else "",
+        )
+    if cmd == "scale":
+        return scale_step(argv[1] if len(argv) > 1 else "")
     print("unknown command: %s" % cmd, file=sys.stderr)
     return 2
 
